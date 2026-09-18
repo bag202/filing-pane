@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in</title>
+<script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+<!-- Pinned and hash-checked. SRI needs an exact version: a floating @3 would
+     fail the integrity check the moment MSAL publishes an update. Bumping the
+     version means recomputing the hash:
+       curl -s <url> | openssl dgst -sha384 -binary | openssl base64 -A
+     No SRI on office.js above -- Microsoft updates it continuously and does
+     not publish stable hashes, so pinning one would break the add-in on their
+     next push. That is their call, not an oversight here. -->
+<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.30.0/lib/msal-browser.min.js"
+        integrity="sha384-YnOjsoOxSYo65h1BXWnSq24bFbqW8HfzMWSEQxYEMRmjW9Vl1J3HZI3iZxqNYvIi"
+        crossorigin="anonymous"></script>
+<style>
+body{margin:0;padding:28px;font-family:"Segoe UI",system-ui,sans-serif;font-size:14px;
+  color:#242424;background:#fff;line-height:1.6}
+@media (prefers-color-scheme:dark){body{color:#e8e6e3;background:#1f1f1f}}
+h1{font-size:17px;font-weight:600;margin:0 0 10px}
+p{margin:0 0 10px;color:#616161}
+@media (prefers-color-scheme:dark){p{color:#a9a5a0}}
+code{font-family:Consolas,monospace;font-size:12px;word-break:break-all}
+</style>
+</head>
+<body>
+<h1 id="head">Connecting to your mailbox&hellip;</h1>
+<p id="msg">One moment.</p>
+
+<script>
+/* Dialog target for the filing pane's sign-in.
+
+   A task pane is an iframe, and Entra refuses to render its login inside one,
+   so the pane opens this page with Office.context.ui.displayDialogAsync. This
+   is a real top-level window, so the redirect flow works here.
+
+   We deliberately do NOT hand the access token back through messageParent.
+   This page and the pane share an origin, so they share MSAL's localStorage
+   cache -- the pane acquires its own token silently once a session exists.
+   That keeps MSAL the single owner of tokens and stops a bearer token from
+   travelling through a postMessage channel. */
+
+(function () {
+  var CLIENT_ID = "31a06f04-ea6c-4268-bf11-bec4e6d9f40d";
+  var TENANT_ID = "7eca4bb5-8a6f-4a5c-ad1f-020604decc5f";
+  var SCOPES = ["User.Read", "Mail.ReadWrite", "Files.ReadWrite.AppFolder"];
+  // AppFolder is where the example bank lives -- consent for it has to be
+  // granted here, in the dialog, or the pane can never read its own bank.
+
+  function say(head, msg) {
+    document.getElementById("head").textContent = head;
+    document.getElementById("msg").innerHTML = msg;
+  }
+
+  // Tell the pane how it went, then let it close us.
+  function done(payload) {
+    if (window.Office && Office.context && Office.context.ui &&
+        Office.context.ui.messageParent) {
+      Office.context.ui.messageParent(JSON.stringify(payload));
+    }
+  }
+
+  function start() {
+    var app = new msal.PublicClientApplication({
+      auth: {
+        clientId: CLIENT_ID,
+        authority: "https://login.microsoftonline.com/" + TENANT_ID,
+        redirectUri: window.location.origin + window.location.pathname,
+        navigateToLoginRequestUrl: false
+      },
+      // localStorage, not sessionStorage: the pane is a different browsing
+      // context and needs to read this cache.
+      cache: { cacheLocation: "localStorage", storeAuthStateInCookie: false }
+    });
+
+    app.initialize()
+      .then(function () { return app.handleRedirectPromise(); })
+      .then(function (result) {
+        if (result && result.account) {
+          say("Signed in", "You can close this window.");
+          return done({ ok: true, username: result.account.username });
+        }
+        if (app.getAllAccounts().length) {
+          say("Already signed in", "You can close this window.");
+          return done({ ok: true, username: app.getAllAccounts()[0].username });
+        }
+        return app.loginRedirect({ scopes: SCOPES, prompt: "select_account" });
+      })
+      .catch(function (err) {
+        var detail = String(err && err.errorCode ? err.errorCode : (err && err.message) || err);
+        say("Sign-in failed", "<code>" + detail + "</code>");
+        done({ ok: false, error: detail });
+      });
+  }
+
+  // Office.js may never signal ready if this page is opened directly in a
+  // browser tab for debugging; don't block sign-in on it.
+  var started = false;
+  function go() { if (!started) { started = true; start(); } }
+  setTimeout(go, 1200);
+  if (window.Office && Office.onReady) Office.onReady(go);
+})();
+</script>
+</body>
+</html>

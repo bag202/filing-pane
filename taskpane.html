@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Filing Pane</title>
+<script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+<!-- Pinned and hash-checked. SRI needs an exact version: a floating @3 would
+     fail the integrity check the moment MSAL publishes an update. Bumping the
+     version means recomputing the hash:
+       curl -s <url> | openssl dgst -sha384 -binary | openssl base64 -A
+     No SRI on office.js above -- Microsoft updates it continuously and does
+     not publish stable hashes, so pinning one would break the add-in on their
+     next push. That is their call, not an oversight here. -->
+<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.30.0/lib/msal-browser.min.js"
+        integrity="sha384-YnOjsoOxSYo65h1BXWnSq24bFbqW8HfzMWSEQxYEMRmjW9Vl1J3HZI3iZxqNYvIi"
+        crossorigin="anonymous"></script>
+<style>
+:root{
+  --ink:#242424; --ink-2:#616161; --ink-3:#8a8886;
+  --panel:#ffffff; --rule:#edebe9; --rule-2:#d6d3d1;
+  --ms:#0f6cbd; --ms-soft:#eff6fc; --ms-ink:#0a4e8a;
+  --warn:#8a5700; --warn-soft:#fff8e6; --bad:#a4262c; --bad-soft:#fdf3f4;
+  --ok:#0f6e56; --ok-soft:#eefaf5;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --ink:#e8e6e3; --ink-2:#a9a5a0; --ink-3:#7a7772;
+    --panel:#262626; --rule:#3b3b3b; --rule-2:#4a4a4a;
+    --ms:#5aa9ef; --ms-soft:#17293b; --ms-ink:#a9d3f7;
+    --warn:#e0b054; --warn-soft:#332a17; --bad:#f1707b; --bad-soft:#3a1d20;
+    --ok:#5dcaa5; --ok-soft:#14302a;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;background:var(--panel);color:var(--ink);
+  font-family:"Segoe UI","Segoe UI Web",system-ui,sans-serif;font-size:13px}
+.head{display:flex;align-items:center;gap:7px;padding-bottom:10px;
+  border-bottom:1px solid var(--rule);margin-bottom:11px}
+.head b{font-size:12.5px;font-weight:600}
+.head .st{margin-left:auto;font-size:11px;color:var(--ink-3)}
+.ctx{margin:0 0 12px;line-height:1.45}
+.ctx .sj{display:block;font-weight:600;font-size:12.5px;word-break:break-word}
+.ctx .fr{display:block;font-size:11.5px;color:var(--ink-3);margin-top:2px;word-break:break-all}
+.rank{font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--ink-3);margin:0 0 6px}
+.sugg{display:block;width:100%;text-align:left;font:inherit;cursor:pointer;
+  background:var(--panel);border:1px solid var(--rule-2);border-radius:6px;
+  padding:9px 11px;margin-bottom:7px;color:var(--ink)}
+.sugg:hover:not(:disabled){border-color:var(--ms)}
+.sugg:focus-visible{outline:2px solid var(--ms);outline-offset:1px}
+.sugg:disabled{opacity:.55;cursor:default}
+.sugg .fn{display:block;font-size:12.5px;font-weight:600;word-break:break-word}
+.sugg .wy{display:block;font-size:11.5px;color:var(--ink-3);margin-top:2px}
+.sugg.top{border-color:var(--ms);background:var(--ms-soft)}
+.sugg.top .fn{color:var(--ms-ink)}
+.sugg.top .wy{color:var(--ms)}
+.sugg.prov{opacity:.62}
+button.link{background:none;border:0;color:var(--ms);cursor:pointer;font:inherit;
+  font-size:11px;padding:0;text-decoration:none}
+button.link:hover{text-decoration:underline}
+input[type=text],input[type=password]{width:100%;font:inherit;font-size:12.5px;
+  padding:7px 10px;border:1px solid var(--rule-2);border-radius:6px;
+  background:var(--panel);color:var(--ink)}
+input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
+.note{font-size:11.5px;color:var(--ink-3);line-height:1.5;margin:9px 0 0}
+.msg{border-radius:5px;padding:8px 10px;font-size:11.5px;line-height:1.5;margin:0 0 11px}
+.msg.warn{background:var(--warn-soft);color:var(--warn)}
+.msg.bad{background:var(--bad-soft);color:var(--bad)}
+.msg.ok{background:var(--ok-soft);color:var(--ok)}
+.foot{margin-top:14px;padding-top:10px;border-top:1px solid var(--rule);
+  font-size:11px;color:var(--ink-3);line-height:1.8}
+#panel{display:none;margin-top:8px}
+#harness{display:none;margin-bottom:12px;padding:10px;
+  border:1px dashed var(--rule-2);border-radius:6px}
+#harness input{margin-bottom:6px}
+</style>
+</head>
+<body>
+
+<div class="head"><b>File this thread</b><span class="st" id="status">starting</span></div>
+
+<div id="alert"></div>
+
+<div id="harness">
+  <p class="note" style="margin:0 0 7px">Not running inside Outlook, so there is no selected message. Type one to test the suggestions.</p>
+  <input type="text" id="t-sender" placeholder="sender@example.com">
+  <input type="text" id="t-subject" placeholder="Subject line">
+  <input type="text" id="t-preview" placeholder="First line of the body (optional)">
+</div>
+
+<p class="ctx"><span class="sj" id="subject">&mdash;</span><span class="fr" id="from"></span></p>
+
+<p class="rank">Most likely</p>
+<div id="suggestions"></div>
+
+<input type="text" id="folder-search" placeholder="Search all folders&hellip;" aria-label="Search all folders" autocomplete="off">
+<div id="results"></div>
+<p class="note">Nothing moves on its own. Filing happens when you press a button.</p>
+
+<div class="foot">
+  <button class="link" id="toggle-panel">settings</button> &middot;
+  <span id="acct">not signed in</span> &middot;
+  <span id="bankinfo">bank: &mdash;</span>
+  <div id="panel">
+    <input type="password" id="apikey" placeholder="Anthropic API key (sk-ant-...)">
+    <p class="note">Stored in this browser only, never written to disk.</p>
+    <p class="note"><button class="link" id="signin">sign in to your mailbox</button>
+      &middot; <button class="link" id="refresh-folders">refresh folder list</button></p>
+    <p class="note">Import a bank file (examples.json) into your OneDrive:<br>
+      <input type="file" id="import-bank" accept="application/json,.json"
+             style="font-size:11px;margin-top:4px"></p>
+  </div>
+</div>
+
+<script src="classifier.js"></script>
+<script src="graph.js"></script>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var KEY_API = "fp_apikey";
+  var KEY_FOLDERS = "fp_folders";          // cached [{id,path}] from Graph
+  var CLIENT_ID = "31a06f04-ea6c-4268-bf11-bec4e6d9f40d";
+  var TENANT_ID = "7eca4bb5-8a6f-4a5c-ad1f-020604decc5f";
+  var SCOPES = ["Mail.ReadWrite", "Files.ReadWrite.AppFolder"];
+  // AppFolder, not Files.ReadWrite: the bank holds years of mail metadata,
+  // so the add-in should reach its own folder and nothing else in the drive.
+
+  var bank = [];          // archive examples
+  var folderMap = [];     // [{id, path}] -- live tree when signed in
+  var folders = [];       // path strings the classifier may choose from
+  var current = null;     // message on screen
+  var seq = 0;            // guards against out-of-order async renders
+  var msalApp = null;
+  var dialog = null;
+
+  function setStatus(t) { $("status").textContent = t; }
+  function alertBox(kind, html) {
+    $("alert").innerHTML = html ? '<div class="msg ' + kind + '">' + html + "</div>" : "";
+  }
+
+  // ---- auth ----------------------------------------------------------
+  function msalReady() {
+    if (msalApp) return Promise.resolve(msalApp);
+    msalApp = new msal.PublicClientApplication({
+      auth: {
+        clientId: CLIENT_ID,
+        authority: "https://login.microsoftonline.com/" + TENANT_ID,
+        // Relative, not origin-rooted: on shared hosting these files sit in a
+        // subfolder, and an origin-rooted path would 404.
+        redirectUri: new URL("auth.html", window.location.href).href
+      },
+      // Shared with auth.html, which is same-origin -- that is how the
+      // dialog's sign-in becomes usable here without passing tokens around.
+      cache: { cacheLocation: "localStorage" }
+    });
+    return msalApp.initialize().then(function () { return msalApp; });
+  }
+
+  function getToken() {
+    return msalReady().then(function (app) {
+      var accounts = app.getAllAccounts();
+      if (!accounts.length) return null;
+      return app.acquireTokenSilent({ scopes: SCOPES, account: accounts[0] })
+        .then(function (r) {
+          $("acct").textContent = accounts[0].username;
+          return r.accessToken;
+        })
+        .catch(function () { return null; });   // caller offers sign-in
+    });
+  }
+
+  // Entra will not render its login inside a task pane iframe, so sign-in has
+  // to happen in an Office dialog. See auth.html.
+  function signIn() {
+    if (!Office.context || !Office.context.ui) {
+      alertBox("bad", "Sign-in needs to run inside Outlook.");
+      return;
+    }
+    Office.context.ui.displayDialogAsync(
+      new URL("auth.html", window.location.href).href,
+      { height: 60, width: 30, promptBeforeOpen: false },
+      function (res) {
+        if (res.status !== Office.AsyncResultStatus.Succeeded) {
+          alertBox("bad", "Could not open the sign-in window: " +
+            (res.error && res.error.message));
+          return;
+        }
+        dialog = res.value;
+        dialog.addEventHandler(Office.EventType.DialogMessageReceived, function (arg) {
+          var payload = {};
+          try { payload = JSON.parse(arg.message); } catch { /* ignore */ }
+          dialog.close();
+          dialog = null;
+          if (payload.ok) {
+            alertBox("", "");
+            loadFolders(true).then(function () { if (current) classify(current); });
+          } else {
+            alertBox("bad", "Sign-in failed. " + (payload.error || ""));
+          }
+        });
+        dialog.addEventHandler(Office.EventType.DialogEventReceived, function () {
+          dialog = null;   // user closed the window themselves
+        });
+      }
+    );
+  }
+
+  // ---- folders -------------------------------------------------------
+  function applyFolders(list) {
+    folderMap = list;
+    folders = list.map(function (f) { return f.path; }).sort();
+  }
+
+  function foldersFromBank() {
+    var seen = {};
+    bank.forEach(function (e) { if (e && e.folder) seen[e.folder] = 1; });
+    folderMap = [];
+    folders = Object.keys(seen).sort();
+  }
+
+  function loadFolders(force) {
+    if (!force) {
+      try {
+        var cached = JSON.parse(localStorage.getItem(KEY_FOLDERS) || "null");
+        if (cached && cached.length) { applyFolders(cached); return Promise.resolve(); }
+      } catch { /* fall through to Graph */ }
+    }
+    return getToken().then(function (token) {
+      if (!token) { foldersFromBank(); return; }
+      return Graph.listFolders(token).then(function (list) {
+        applyFolders(list);
+        try { localStorage.setItem(KEY_FOLDERS, JSON.stringify(list)); } catch {}
+      }).catch(function (err) {
+        foldersFromBank();
+        alertBox("warn", "Could not read your folder list (" +
+          String(err.message || err) + "). Falling back to folders seen in the bank.");
+      });
+    });
+  }
+
+  // ---- filing --------------------------------------------------------
+  function folderIdFor(path) {
+    for (var i = 0; i < folderMap.length; i++) {
+      if (folderMap[i].path === path) return folderMap[i].id;
+    }
+    return null;
+  }
+
+  function setButtonsDisabled(on) {
+    Array.prototype.forEach.call(
+      document.querySelectorAll(".sugg"), function (b) { b.disabled = on; });
+  }
+
+  function fileTo(path) {
+    var destId = folderIdFor(path);
+    if (!destId) {
+      alertBox("warn", "Sign in to your mailbox before filing &mdash; the pane " +
+        "needs the real folder list to know where <b>" + path + "</b> is.");
+      return;
+    }
+    if (!current || !current.messageId) {
+      alertBox("warn", "No message is selected.");
+      return;
+    }
+
+    setButtonsDisabled(true);
+    setStatus("filing");
+    getToken().then(function (token) {
+      if (!token) throw new Error("not signed in");
+      return Graph.moveThread(token, current.messageId, destId);
+    }).then(function (moved) {
+      alertBox("ok", "Filed " + moved + (moved === 1 ? " message" : " messages") +
+        " to <b>" + path + "</b>.");
+      setStatus("filed");
+      // A correction is worth more than an acceptance: record what was
+      // actually chosen so the bank learns the boundary it got wrong.
+      recordChoice(path);
+    }).catch(function (err) {
+      alertBox("bad", "Could not file: " + String(err.message || err));
+      setStatus("failed");
+    }).then(function () {
+      setButtonsDisabled(false);
+    });
+  }
+
+  function recordChoice(path) {
+    if (!current) return;
+    var entry = {
+      sender: current.sender, subject: current.subject,
+      folder: path, ts: Date.now()
+    };
+    bank.push(entry);
+    getToken().then(function (token) {
+      if (token) return Graph.saveExamples(token, bank);
+    }).catch(function () {
+      // The in-memory bank still grew, so this session keeps learning; the
+      // write is retried next time a correction is made.
+    });
+    $("bankinfo").textContent =
+      "bank: " + bank.length + " examples, " + folders.length + " folders";
+  }
+
+  // ---- suggestions ---------------------------------------------------
+  function renderSuggestions(list, provisional) {
+    var host = $("suggestions");
+    host.innerHTML = "";
+    list.forEach(function (s, i) {
+      var b = document.createElement("button");
+      b.className = "sugg" + (i === 0 ? " top" : "") + (provisional ? " prov" : "");
+      var fn = document.createElement("span");
+      fn.className = "fn"; fn.textContent = s.folder;
+      var wy = document.createElement("span");
+      wy.className = "wy"; wy.textContent = s.why || "";
+      b.appendChild(fn); b.appendChild(wy);
+      b.onclick = function () { fileTo(s.folder); };
+      host.appendChild(b);
+    });
+  }
+
+  function classify(msg) {
+    var mine = ++seq;
+    current = msg;
+    $("subject").textContent = msg.subject || "(no subject)";
+    $("from").textContent = msg.sender || "";
+
+    if (!bank.length) {
+      $("suggestions").innerHTML = "";
+      alertBox("warn", "No example bank yet. Sign in to your mailbox in " +
+        "settings &mdash; the bank is stored in your OneDrive.");
+      return;
+    }
+
+    var hits = FilingClassifier.retrieve(msg, bank);
+    renderSuggestions(FilingClassifier.heuristic(hits), true);   // instant
+    setStatus("thinking");
+
+    var apiKey = localStorage.getItem(KEY_API);
+    if (!apiKey) {
+      setStatus("no api key");
+      alertBox("warn", "Add an Anthropic API key in settings for ranked " +
+        "suggestions. The greyed list is sender history only.");
+      return;
+    }
+
+    FilingClassifier.rank(msg, hits, folders, apiKey).then(function (ranked) {
+      if (mine !== seq) return;          // a newer message arrived; drop this
+      renderSuggestions(ranked, false);
+      alertBox("", "");
+      setStatus("ready");
+    }).catch(function (err) {
+      if (mine !== seq) return;
+      setStatus("fell back");
+      alertBox("bad", "Ranking failed, showing sender history instead. " +
+        String(err && err.message ? err.message : err));
+    });
+  }
+
+  // ---- folder search -------------------------------------------------
+  $("folder-search").addEventListener("input", function (e) {
+    var q = e.target.value.trim().toLowerCase();
+    var host = $("results");
+    host.innerHTML = "";
+    if (!q) return;
+    folders.filter(function (f) {
+      return f.toLowerCase().indexOf(q) !== -1;
+    }).slice(0, 8).forEach(function (f) {
+      var b = document.createElement("button");
+      b.className = "sugg";
+      var fn = document.createElement("span");
+      fn.className = "fn"; fn.textContent = f;
+      b.appendChild(fn);
+      b.onclick = function () { fileTo(f); };
+      host.appendChild(b);
+    });
+  });
+
+  // ---- settings ------------------------------------------------------
+  $("toggle-panel").onclick = function () {
+    var p = $("panel");
+    p.style.display = p.style.display === "block" ? "none" : "block";
+  };
+  $("signin").onclick = signIn;
+  $("refresh-folders").onclick = function () {
+    setStatus("reading folders");
+    loadFolders(true).then(function () {
+      setStatus("ready");
+      alertBox("ok", "Folder list refreshed: " + folders.length + " folders.");
+    });
+  };
+  // One-time migration path, and a restore-from-backup afterwards. Reading
+  // the file locally avoids guessing where approot lands in the drive.
+  $("import-bank").addEventListener("change", function (e) {
+    var file = e.target.files && e.target.files[0];
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      var parsed;
+      try {
+        parsed = JSON.parse(reader.result);
+      } catch (err) {
+        alertBox("bad", "That file is not valid JSON.");
+        return;
+      }
+      if (!Array.isArray(parsed) || !parsed.length) {
+        alertBox("bad", "Expected a non-empty array of examples.");
+        return;
+      }
+      var bad = parsed.filter(function (x) {
+        return !x || !x.sender || !x.subject || !x.folder;
+      });
+      if (bad.length) {
+        alertBox("bad", bad.length + " entries are missing sender, subject or " +
+          "folder. Nothing was imported.");
+        return;
+      }
+      setStatus("importing");
+      getToken().then(function (token) {
+        if (!token) throw new Error("sign in first");
+        return Graph.saveExamples(token, parsed);
+      }).then(function () {
+        bank = parsed;
+        $("bankinfo").textContent = "bank: " + bank.length + " examples";
+        alertBox("ok", "Imported " + bank.length + " examples to your OneDrive.");
+        setStatus("ready");
+        if (current) classify(current);
+      }).catch(function (err) {
+        alertBox("bad", "Import failed: " + String(err.message || err));
+        setStatus("failed");
+      });
+    };
+    reader.readAsText(file);
+  });
+
+  $("apikey").value = localStorage.getItem(KEY_API) || "";
+  $("apikey").addEventListener("change", function (e) {
+    localStorage.setItem(KEY_API, e.target.value.trim());
+    if (current) classify(current);
+  });
+
+  // ---- boot ----------------------------------------------------------
+  // The bank lives in OneDrive now, so it needs a token -- which means an
+  // unsigned-in pane has no bank and therefore no suggestions. That is the
+  // honest behaviour: better an empty pane that says why than one quietly
+  // guessing from nothing.
+  function loadBank() {
+    return getToken().then(function (token) {
+      if (!token) { bank = []; return; }
+      return Graph.loadExamples(token).then(function (data) {
+        bank = data;
+      }).catch(function (err) {
+        bank = [];
+        alertBox("warn", "Could not read the example bank: " +
+          String(err.message || err));
+      });
+    }).then(function () {
+      $("bankinfo").textContent = "bank: " + bank.length + " examples";
+    });
+  }
+
+  function fromOffice() {
+    var item = Office.context.mailbox.item;
+    if (!item) return null;
+    var f = item.from || item.sender || {};
+    var restId = null;
+    try {
+      // Office.js ids are EWS format; Graph needs the REST form.
+      restId = Office.context.mailbox.convertToRestId(
+        item.itemId, Office.MailboxEnums.RestVersion.v2_0);
+    } catch { /* compose mode, or no item id */ }
+    return {
+      subject: item.subject || "",
+      sender: f.emailAddress || f.displayName || "",
+      preview: "",
+      messageId: restId
+    };
+  }
+
+  function startHarness() {
+    $("harness").style.display = "block";
+    setStatus("test mode");
+    function read() {
+      classify({
+        subject: $("t-subject").value,
+        sender: $("t-sender").value,
+        preview: $("t-preview").value,
+        messageId: null
+      });
+    }
+    ["t-sender", "t-subject", "t-preview"].forEach(function (id) {
+      $(id).addEventListener("change", read);
+    });
+  }
+
+  loadBank()
+    .then(function () { return loadFolders(false); })
+    .then(function () {
+      if (!folders.length) foldersFromBank();
+      $("bankinfo").textContent =
+        "bank: " + bank.length + " examples, " + folders.length + " folders";
+
+      var started = false;
+      var timer = setTimeout(function () {
+        if (!started) { started = true; startHarness(); }
+      }, 1500);
+
+      if (typeof Office !== "undefined" && Office.onReady) {
+        Office.onReady(function (info) {
+          if (!info || !info.host) return;       // not really in Outlook
+          clearTimeout(timer);
+          if (started) return;
+          started = true;
+          setStatus("ready");
+          var m = fromOffice();
+          if (m) classify(m);
+          if (Office.context.requirements.isSetSupported("Mailbox", "1.5")) {
+            Office.context.mailbox.addHandlerAsync(
+              Office.EventType.ItemChanged, function () {
+                var n = fromOffice();
+                if (n) classify(n);
+              });
+          }
+        });
+      }
+    });
+})();
+</script>
+</body>
+</html>

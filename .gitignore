@@ -1,0 +1,21 @@
+# The example bank: sender addresses, subject lines and folder names pulled
+# from a live mailbox. Never commit this -- it is the whole point of keeping
+# the bank in OneDrive rather than beside the published files.
+examples.json
+
+# Dev TLS certificate. The real one lives in %LOCALAPPDATA%, outside any
+# synced or version-controlled folder, but catch a stray copy anyway.
+certs/
+*.pem
+*.key
+*.pfx
+
+# Never let an API key land in the repo. The Anthropic key belongs in the
+# browser's localStorage, entered through the pane's settings.
+.env
+*.secret
+
+# OS noise
+Thumbs.db
+desktop.ini
+.DS_Store
