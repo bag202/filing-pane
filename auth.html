@@ -36,11 +36,18 @@ code{font-family:Consolas,monospace;font-size:12px;word-break:break-all}
    so the pane opens this page with Office.context.ui.displayDialogAsync. This
    is a real top-level window, so the redirect flow works here.
 
-   We deliberately do NOT hand the access token back through messageParent.
-   This page and the pane share an origin, so they share MSAL's localStorage
-   cache -- the pane acquires its own token silently once a session exists.
-   That keeps MSAL the single owner of tokens and stops a bearer token from
-   travelling through a postMessage channel. */
+   This page hands the access token back through messageParent.
+
+   An earlier version deliberately did not, on the reasoning that this page
+   and the pane share an origin and therefore share MSAL's localStorage cache.
+   That was wrong. The pane is an iframe inside outlook.office.com and Chrome
+   partitions third-party storage by (top-level site, frame origin), while
+   this page is a top-level window on our own origin. Two different buckets,
+   so the session established here is invisible to the pane -- it reported
+   "not signed in" immediately after a successful sign-in.
+
+   So the token travels back over Office's dialog channel, which delivers only
+   to the add-in that opened this window. */
 
 (function () {
   var CLIENT_ID = "31a06f04-ea6c-4268-bf11-bec4e6d9f40d";
@@ -75,17 +82,29 @@ code{font-family:Consolas,monospace;font-size:12px;word-break:break-all}
       cache: { cacheLocation: "localStorage", storeAuthStateInCookie: false }
     });
 
+    // Only the Graph scopes the pane actually calls with. User.Read is in
+    // SCOPES for the consent prompt, but it has no business in a token that
+    // gets passed around.
+    var GRAPH_SCOPES = ["Mail.ReadWrite", "Files.ReadWrite.AppFolder"];
+
+    function handoff(app, account) {
+      return app.acquireTokenSilent({ scopes: GRAPH_SCOPES, account: account })
+        .then(function (r) {
+          say("Signed in", "You can close this window.");
+          done({
+            ok: true,
+            username: account.username,
+            token: r.accessToken,
+            expiresOn: r.expiresOn ? new Date(r.expiresOn).getTime() : 0
+          });
+        });
+    }
+
     app.initialize()
       .then(function () { return app.handleRedirectPromise(); })
       .then(function (result) {
-        if (result && result.account) {
-          say("Signed in", "You can close this window.");
-          return done({ ok: true, username: result.account.username });
-        }
-        if (app.getAllAccounts().length) {
-          say("Already signed in", "You can close this window.");
-          return done({ ok: true, username: app.getAllAccounts()[0].username });
-        }
+        var account = (result && result.account) || app.getAllAccounts()[0];
+        if (account) return handoff(app, account);
         return app.loginRedirect({ scopes: SCOPES, prompt: "select_account" });
       })
       .catch(function (err) {

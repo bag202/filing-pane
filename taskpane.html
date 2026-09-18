@@ -150,20 +150,63 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
         // subfolder, and an origin-rooted path would 404.
         redirectUri: new URL("auth.html", window.location.href).href
       },
-      // Shared with auth.html, which is same-origin -- that is how the
-      // dialog's sign-in becomes usable here without passing tokens around.
+      // NOT shared with auth.html, despite the shared origin: this page is a
+      // third-party iframe inside outlook.office.com and Chrome partitions
+      // storage by (top-level site, frame origin). Kept anyway so a silent
+      // renewal works wherever storage is not partitioned.
       cache: { cacheLocation: "localStorage" }
     });
     return msalApp.initialize().then(function () { return msalApp; });
   }
 
+  /* The token the sign-in dialog handed us.
+
+     The dialog cannot simply leave a session behind for us to pick up: it is
+     a top-level window on our origin, this pane is an iframe inside
+     outlook.office.com, and Chrome gives those two different storage buckets.
+     So it passes the token over Office's dialog channel and we hold it here
+     until it expires, at which point the user signs in again. */
+  var TOKEN_KEY = "fp_token";
+  var cachedToken = null;
+  var cachedExpiry = 0;
+  var cachedUser = "";
+
+  (function restoreToken() {
+    try {
+      var t = JSON.parse(localStorage.getItem(TOKEN_KEY) || "null");
+      if (t && t.token && t.expiry > Date.now() + 60000) {
+        cachedToken = t.token; cachedExpiry = t.expiry; cachedUser = t.user || "";
+      }
+    } catch { /* unavailable or corrupt -- just sign in again */ }
+  })();
+
+  function keepToken(token, expiry, user) {
+    cachedToken = token;
+    // Fall back to a conservative hour if the dialog gave us no expiry.
+    cachedExpiry = expiry || (Date.now() + 55 * 60 * 1000);
+    cachedUser = user || cachedUser;
+    if (cachedUser) $("acct").textContent = cachedUser;
+    try {
+      localStorage.setItem(TOKEN_KEY, JSON.stringify(
+        { token: cachedToken, expiry: cachedExpiry, user: cachedUser }));
+    } catch { /* fine -- it just won't survive reopening the pane */ }
+  }
+
   function getToken() {
+    if (cachedToken && Date.now() < cachedExpiry - 60000) {
+      if (cachedUser) $("acct").textContent = cachedUser;
+      return Promise.resolve(cachedToken);
+    }
+    cachedToken = null;
+    // Still try MSAL: harmless, and it works where storage is not partitioned.
     return msalReady().then(function (app) {
       var accounts = app.getAllAccounts();
       if (!accounts.length) return null;
       return app.acquireTokenSilent({ scopes: SCOPES, account: accounts[0] })
         .then(function (r) {
-          $("acct").textContent = accounts[0].username;
+          keepToken(r.accessToken,
+            r.expiresOn ? new Date(r.expiresOn).getTime() : 0,
+            accounts[0].username);
           return r.accessToken;
         })
         .catch(function () { return null; });   // caller offers sign-in
@@ -194,6 +237,9 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
           dialog = null;
           if (payload.ok) {
             alertBox("", "");
+            if (payload.token) {
+              keepToken(payload.token, payload.expiresOn, payload.username);
+            }
             loadFolders(true).then(function () { if (current) classify(current); });
           } else {
             alertBox("bad", "Sign-in failed. " + (payload.error || ""));
