@@ -492,6 +492,35 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
     });
   }
 
+  /* Are we inside an Office host at all?
+
+     Office appends _host_Info to the task pane URL when it loads us, so this
+     is known synchronously and does not depend on any handshake completing.
+     Guessing from a timer instead was the original bug: the pane decided it
+     was not in Outlook simply because the host was slow to answer. */
+  var inHost = /[?&]_host_Info=/i.test(window.location.search);
+
+  /* Start the handshake NOW, not after the bank and folder loads. Those are
+     network-bound and used to delay this by seconds. Calling Office.onReady()
+     with no argument returns a promise, and it still resolves if the host
+     signalled ready before we asked. */
+  var officeReady = (typeof Office !== "undefined" && Office.onReady)
+    ? Office.onReady()
+    : Promise.resolve(null);
+
+  // Resolve null rather than hang if the host never answers.
+  function withTimeout(p, ms) {
+    return new Promise(function (resolve) {
+      var settled = false;
+      function finish(v) {
+        if (settled) return;
+        settled = true; clearTimeout(t); resolve(v);
+      }
+      var t = setTimeout(function () { finish(null); }, ms);
+      p.then(finish, function () { finish(null); });
+    });
+  }
+
   loadBank()
     .then(function () { return loadFolders(false); })
     .then(function () {
@@ -499,28 +528,36 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
       $("bankinfo").textContent =
         "bank: " + bank.length + " examples, " + folders.length + " folders";
 
-      var started = false;
-      var timer = setTimeout(function () {
-        if (!started) { started = true; startHarness(); }
-      }, 1500);
+      // Inside a host we can afford to wait properly; the pane is useless
+      // without the selected message, so falling back early helps nobody.
+      // Opened directly in a browser tab, fail over quickly to the harness.
+      return withTimeout(officeReady, inHost ? 20000 : 1500);
+    })
+    .then(function (info) {
+      var haveMailbox = !!(typeof Office !== "undefined" &&
+        Office.context && Office.context.mailbox);
 
-      if (typeof Office !== "undefined" && Office.onReady) {
-        Office.onReady(function (info) {
-          if (!info || !info.host) return;       // not really in Outlook
-          clearTimeout(timer);
-          if (started) return;
-          started = true;
-          setStatus("ready");
-          var m = fromOffice();
-          if (m) classify(m);
-          if (Office.context.requirements.isSetSupported("Mailbox", "1.5")) {
-            Office.context.mailbox.addHandlerAsync(
-              Office.EventType.ItemChanged, function () {
-                var n = fromOffice();
-                if (n) classify(n);
-              });
-          }
-        });
+      if (!(info && info.host) && !haveMailbox) {
+        // Genuinely not in Outlook -- or the host never completed. Say which,
+        // so a silent fallback is never mistaken for normal operation.
+        startHarness();
+        if (inHost) {
+          alertBox("warn", "Outlook loaded the pane but never finished " +
+            "connecting, so there is no selected message. Reopen the pane, " +
+            "and if it keeps happening the console will have the reason.");
+        }
+        return;
+      }
+
+      setStatus("ready");
+      var m = fromOffice();
+      if (m) classify(m);
+      if (Office.context.requirements.isSetSupported("Mailbox", "1.5")) {
+        Office.context.mailbox.addHandlerAsync(
+          Office.EventType.ItemChanged, function () {
+            var n = fromOffice();
+            if (n) classify(n);
+          });
       }
     });
 })();
