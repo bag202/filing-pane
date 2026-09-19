@@ -163,6 +163,7 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
   var current = null;     // message on screen
   var seq = 0;            // guards against out-of-order async renders
   var msalApp = null;
+  var brokered = false;   // true once the host is brokering our tokens
   var dialog = null;
 
   function setStatus(t) { $("status").textContent = t; }
@@ -199,7 +200,61 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
     return loadMsalScript().then(buildMsal);
   }
 
+  /* Will the host broker tokens for us?
+
+     Unsupported on Outlook.com and Gmail mailboxes even where the client
+     itself supports it, so this is a per-session answer, not a per-build one.
+     Checked at runtime because Outlook does not allow NestedAppAuth to be
+     declared in the manifest. */
+  function hostBrokersTokens() {
+    try {
+      return !!(typeof Office !== "undefined" && Office.context &&
+        Office.context.requirements &&
+        Office.context.requirements.isSetSupported("NestedAppAuth", "1.1"));
+    } catch { return false; }
+  }
+
+  /* Nested app authentication: instead of authenticating ourselves, ask
+     Outlook -- which already has the user signed in -- to get tokens on our
+     behalf. That is what fixes the hourly prompt. The dialog we use otherwise
+     can only hand back an access token, never a refresh token, because it is
+     a top-level window on our origin while this pane is a third-party iframe
+     inside outlook.office.com, and Chrome gives those two different storage
+     buckets. Brokered tokens sidestep that entirely: nothing has to cross
+     between the two contexts.
+
+     Inert until brk-multihub://<origin> is registered as an SPA redirect URI
+     on the app registration. Without it the broker declines and we fall
+     through to the dialog below, exactly as before. */
   function buildMsal() {
+    if (msalApp) return Promise.resolve(msalApp);
+
+    if (hostBrokersTokens() && msal.createNestablePublicClientApplication) {
+      // No redirectUri here on purpose: the broker supplies its own, and a
+      // configured one is ignored (MSAL issue 7590). Keeping the tenant
+      // authority rather than the docs' "common" -- this is a single-tenant
+      // mailbox and that is what the dialog path already uses.
+      return msal.createNestablePublicClientApplication({
+        auth: {
+          clientId: CLIENT_ID,
+          authority: "https://login.microsoftonline.com/" + TENANT_ID
+        },
+        cache: { cacheLocation: "localStorage" }
+      }).then(function (app) {
+        msalApp = app;
+        brokered = true;
+        mark("msal ready (brokered by the host)");
+        return app;
+      }).catch(function (err) {
+        // Broker refused. Fall back rather than leaving the pane unusable.
+        mark("broker unavailable (" + (err && err.message) + "); using the dialog");
+        return buildStandaloneMsal();
+      });
+    }
+    return buildStandaloneMsal();
+  }
+
+  function buildStandaloneMsal() {
     if (msalApp) return Promise.resolve(msalApp);
     msalApp = new msal.PublicClientApplication({
       auth: {
@@ -260,6 +315,31 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
     // Still try MSAL: harmless, and it works where storage is not partitioned.
     return msalReady().catch(function () { return null; }).then(function (app) {
       if (!app) return null;               // MSAL unreachable; offer sign-in
+
+      if (brokered) {
+        /* No account lookup first: under NAA the account lives with the host,
+           so our own cache can legitimately be empty while the user is very
+           much signed in. This is the call that replaces the hourly prompt.
+
+           Silent only. An interaction-required failure here means something a
+           prompt could fix (expired session, MFA), but this runs in the
+           background -- on boot, behind a reconcile -- and a popup nobody
+           asked for is the wrong answer. It is offered from the sign-in
+           button instead, where there is a gesture behind it. */
+        return app.acquireTokenSilent({ scopes: SCOPES })
+          .then(function (r) {
+            keepToken(r.accessToken,
+              r.expiresOn ? new Date(r.expiresOn).getTime() : 0,
+              r.account && r.account.username);
+            mark("token renewed silently by the host");
+            return r.accessToken;
+          })
+          .catch(function (err) {
+            mark("silent renewal declined (" + (err && err.name) + ")");
+            return null;                   // caller offers sign-in
+          });
+      }
+
       var accounts = app.getAllAccounts();
       if (!accounts.length) return null;
       return app.acquireTokenSilent({ scopes: SCOPES, account: accounts[0] })
@@ -276,6 +356,33 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
   // Entra will not render its login inside a task pane iframe, so sign-in has
   // to happen in an Office dialog. See auth.html.
   function signIn() {
+    // With a broker available, a popup it owns beats our dialog: it returns a
+    // renewable session rather than one access token with an hour on it.
+    if (hostBrokersTokens()) {
+      setStatus("signing in");
+      msalReady().then(function (app) {
+        if (!brokered) throw new Error("broker unavailable");
+        return app.acquireTokenPopup({ scopes: SCOPES });
+      }).then(function (r) {
+        keepToken(r.accessToken,
+          r.expiresOn ? new Date(r.expiresOn).getTime() : 0,
+          r.account && r.account.username);
+        alertBox("", "");
+        setStatus("ready");
+        mark("signed in through the host");
+        return loadFolders(true).then(function () {
+          return refreshBank(bank.length > 0);
+        }).then(function () { if (current) classify(current); });
+      }).catch(function (err) {
+        mark("brokered sign-in failed (" + (err && err.message) + "); using the dialog");
+        openAuthDialog();
+      });
+      return;
+    }
+    openAuthDialog();
+  }
+
+  function openAuthDialog() {
     if (!Office.context || !Office.context.ui) {
       alertBox("bad", "Sign-in needs to run inside Outlook.");
       return;
