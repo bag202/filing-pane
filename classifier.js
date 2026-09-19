@@ -203,7 +203,12 @@ Exactly 3 suggestions, best first, all different, all from the valid list.`;
      about a fifth of it, the rest being the two lower suggestions and their
      evidence. That fifth is a fraction of generation only -- time to first
      token is unchanged, so treat it as a useful cut, not a halving. */
-  async function rank(msg, hits, folders, apiKey, model, onPartial) {
+  async function rank(msg, hits, folders, apiKey, model, hooks) {
+    // Accept a bare onPartial too, which is how this was first called.
+    if (typeof hooks === "function") hooks = { onPartial: hooks };
+    hooks = hooks || {};
+    const onPartial = hooks.onPartial;
+    const onFirstByte = hooks.onFirstByte;
     // Haiku 4.5 rejects output_config.effort outright ("This model does not
     // support the effort parameter"), so only send it where it is supported.
     const body = {
@@ -257,6 +262,9 @@ Exactly 3 suggestions, best first, all different, all from the valid list.`;
             let ev;
             try { ev = JSON.parse(raw); } catch { continue; }
             if (ev.type === "content_block_delta" && ev.delta) {
+              // The wait before this fires is time-to-first-token, which is
+              // most of the wait overall -- worth measuring, not inferring.
+              if (onFirstByte && !text) onFirstByte();
               text += ev.delta.text || ev.delta.partial_json || "";
             } else if (ev.type === "error") {
               throw new Error("Anthropic stream: " +
@@ -285,7 +293,16 @@ Exactly 3 suggestions, best first, all different, all from the valid list.`;
     return out;
   }
 
-  return { tokenize, retrieve, heuristic, rank, parsePartial, MODEL };
+  /* buildPrompt is exported so the pane can key its ranking cache on the
+     exact prompt. That makes the cache correct by construction rather than by
+     argument: the ranked answer is a pure function of this string, so an
+     identical string may reuse an earlier answer, and any change to the
+     message, the retrieved examples or the folder list produces a different
+     string and therefore a miss. Filing an unrelated thread grows the bank
+     without touching what this message retrieves -- so it correctly keeps the
+     entry -- while filing something similar changes the retrieved set and
+     correctly drops it. */
+  return { tokenize, retrieve, heuristic, rank, parsePartial, buildPrompt, MODEL };
 })();
 
 if (typeof window !== "undefined") window.FilingClassifier = FilingClassifier;

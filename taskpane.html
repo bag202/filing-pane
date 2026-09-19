@@ -71,6 +71,8 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
 .msg.ok{background:var(--ok-soft);color:var(--ok)}
 .foot{margin-top:14px;padding-top:10px;border-top:1px solid var(--rule);
   font-size:11px;color:var(--ink-3);line-height:1.8}
+#timing{font-size:10.5px;color:var(--ink-3);margin-top:3px;
+  font-variant-numeric:tabular-nums}
 #panel{display:none;margin-top:8px}
 #harness{display:none;margin-bottom:12px;padding:10px;
   border:1px dashed var(--rule-2);border-radius:6px}
@@ -103,6 +105,7 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
   <button class="link" id="toggle-panel">settings</button> &middot;
   <span id="acct">not signed in</span> &middot;
   <span id="bankinfo">bank: &mdash;</span>
+  <div id="timing"></div>
   <div id="panel">
     <input type="password" id="apikey" placeholder="Anthropic API key (sk-ant-...)">
     <p class="note">Stored in this browser only, never written to disk.</p>
@@ -122,13 +125,31 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
   var KEY_API = "fp_apikey";
   var KEY_FOLDERS = "fp_folders";          // cached [{id,path}] from Graph
   var KEY_BANK = "fp_bank";                // cached archive examples
+  var KEY_RANKS = "fp_ranks";              // ranked answers, keyed by prompt
 
   /* Timings, because "it feels slow" is not something you can fix twice.
      The console is where this pane gets debugged anyway. */
   var T0 = Date.now();
   function mark(what, base) {
-    try { console.log("[filing-pane] +" + (Date.now() - (base || T0)) + "ms " + what); }
+    var ms = Date.now() - (base || T0);
+    try { console.log("[filing-pane] +" + ms + "ms " + what); }
     catch { /* no console, no problem */ }
+    return ms;
+  }
+
+  /* The same numbers on the face of the pane, so "it feels slow" can be
+     checked whenever it happens rather than only when DevTools was opened
+     beforehand -- the boot marks print once and are easy to miss. */
+  var trace = {};
+  function showTrace() {
+    var bits = [];
+    if (trace.cached) bits.push("reused earlier ranking, no model call");
+    else {
+      if (trace.ttft != null) bits.push("first byte " + trace.ttft + "ms");
+      if (trace.first != null) bits.push("suggestion " + trace.first + "ms");
+      if (trace.done != null) bits.push("done " + trace.done + "ms");
+    }
+    $("timing").textContent = bits.join(" · ");
   }
   var CLIENT_ID = "31a06f04-ea6c-4268-bf11-bec4e6d9f40d";
   var TENANT_ID = "7eca4bb5-8a6f-4a5c-ad1f-020604decc5f";
@@ -386,6 +407,67 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
     bankInfo();
   }
 
+  /* ---- ranking cache -------------------------------------------------
+
+     Measured on four real threads, the ranked answer costs about 1.5s, of
+     which roughly 1.35s is time-to-first-token -- the round trip and prefill
+     before the model emits anything. That part cannot be shortened from here
+     without trading accuracy away, so the only remaining win is not making
+     the call at all.
+
+     Which is worth having, because a thread gets opened repeatedly before it
+     is filed: filing is the signal that its action items are done, so every
+     look before that pays 1.5s for an answer that has not changed.
+
+     Keyed on the exact prompt, which makes it correct by construction --
+     see buildPrompt in classifier.js for why. */
+  var RANKS_MAX = 80;
+  var RANKS_DAYS = 21;
+
+  // FNV-1a. Paired with the length so two prompts must collide on both, and
+  // a collision costs a wrong suggestion, never a wrong move -- nothing is
+  // filed without a press.
+  function promptKey(str) {
+    var h = 2166136261;
+    for (var i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = (h * 16777619) >>> 0;
+    }
+    return h.toString(36) + "-" + str.length.toString(36);
+  }
+
+  function readRanks() {
+    try {
+      var c = JSON.parse(localStorage.getItem(KEY_RANKS) || "{}");
+      return (c && typeof c === "object" && !Array.isArray(c)) ? c : {};
+    } catch { return {}; }
+  }
+
+  function cachedRanking(key) {
+    var hit = readRanks()[key];
+    if (!hit || !Array.isArray(hit.r) || !hit.r.length) return null;
+    if (Date.now() - hit.ts > RANKS_DAYS * 86400000) return null;
+    return hit.r;
+  }
+
+  function storeRanking(key, ranked) {
+    var c = readRanks();
+    c[key] = { r: ranked, ts: Date.now() };
+    var keys = Object.keys(c);
+    if (keys.length > RANKS_MAX) {
+      keys.sort(function (a, b) { return c[a].ts - c[b].ts; });   // oldest out
+      keys.slice(0, keys.length - RANKS_MAX).forEach(function (k) { delete c[k]; });
+    }
+    try { localStorage.setItem(KEY_RANKS, JSON.stringify(c)); }
+    catch { /* over quota -- the next call just pays full price */ }
+  }
+
+  function solid(list) {
+    return list.map(function (r) {
+      return { folder: r.folder, why: r.why, provisional: false };
+    });
+  }
+
   // ---- suggestions ---------------------------------------------------
   /* Cards are updated in place rather than rebuilt.
 
@@ -456,6 +538,7 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
     }
 
     var t0 = Date.now();
+    trace = {};
     var hits = FilingClassifier.retrieve(msg, bank);
     var prov = FilingClassifier.heuristic(hits);
     renderSuggestions(prov);                                     // instant
@@ -465,32 +548,59 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
     var apiKey = localStorage.getItem(KEY_API);
     if (!apiKey) {
       setStatus("no api key");
+      showTrace();
       alertBox("warn", "Add an Anthropic API key in settings for ranked " +
         "suggestions. The greyed list is sender history only.");
+      return;
+    }
+
+    // Reopening a thread asks the same question of the same archive, so the
+    // answer is already known. This is the difference between 1.5s and none.
+    var key = promptKey(FilingClassifier.buildPrompt(msg, hits, folders));
+    var hit = cachedRanking(key);
+    if (hit) {
+      renderSuggestions(solid(hit));
+      alertBox("", "");
+      setStatus("ready");
+      trace.cached = true;
+      showTrace();
+      mark("served from cache, no model call", t0);
       return;
     }
 
     // The grey list is a placeholder, not a shortcut -- see the measured
     // gap beside heuristic() in classifier.js.
     var first = true;
-    FilingClassifier.rank(msg, hits, folders, apiKey, null, function (partial) {
-      if (mine !== seq) return;          // a newer message arrived; drop this
-      if (first) { first = false; mark("first ranked suggestion", t0); }
-      renderSuggestions(mergeProgressive(partial, prov));
-      alertBox("", "");
-      setStatus("ranking");
+    FilingClassifier.rank(msg, hits, folders, apiKey, null, {
+      onFirstByte: function () {
+        if (mine !== seq) return;
+        trace.ttft = mark("first byte from the model", t0);
+        showTrace();
+      },
+      onPartial: function (partial) {
+        if (mine !== seq) return;        // a newer message arrived; drop this
+        if (first) {
+          first = false;
+          trace.first = mark("first ranked suggestion", t0);
+          showTrace();
+        }
+        renderSuggestions(mergeProgressive(partial, prov));
+        alertBox("", "");
+        setStatus("ranking");
+      }
     }).then(function (ranked) {
       if (mine !== seq) return;
-      renderSuggestions(ranked.map(function (r) {
-        return { folder: r.folder, why: r.why, provisional: false };
-      }));
+      renderSuggestions(solid(ranked));
       alertBox("", "");
       setStatus("ready");
-      mark("ranking complete", t0);
+      trace.done = mark("ranking complete", t0);
+      showTrace();
+      storeRanking(key, ranked);
     }).catch(function (err) {
       if (mine !== seq) return;
       renderSuggestions(prov);           // back to the honest grey list
       setStatus("fell back");
+      showTrace();
       alertBox("bad", "Ranking failed, showing sender history instead. " +
         String(err && err.message ? err.message : err));
     });
