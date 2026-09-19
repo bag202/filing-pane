@@ -421,8 +421,20 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
 
      Keyed on the exact prompt, which makes it correct by construction --
      see buildPrompt in classifier.js for why. */
-  var RANKS_MAX = 80;
-  var RANKS_DAYS = 21;
+  /* Sized against how this actually gets used rather than out of caution.
+     Every distinct message opened stores an entry, so at a few dozen a day an
+     80-entry cap evicted within days -- the clock never got a chance to be the
+     binding constraint. At roughly 275 bytes an entry, 1000 of them is ~275KB
+     against a ~5MB budget, which costs nothing.
+
+     The expiry is doing less work than it looks, too. Every change that could
+     make a cached answer wrong -- the message, the folder list, the filing
+     history behind what it retrieves -- already changes the prompt and
+     therefore the key. The clock only covers the model itself moving under
+     the cache, which is slow, so it can be generous. */
+  var RANKS_MAX = 1000;
+  var RANKS_DAYS = 90;
+  var RANKS_TOUCH_MS = 3600000;   // how stale a stamp gets before a hit rewrites it
 
   // FNV-1a. Paired with the length so two prompts must collide on both, and
   // a collision costs a wrong suggestion, never a wrong move -- nothing is
@@ -444,9 +456,24 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
   }
 
   function cachedRanking(key) {
-    var hit = readRanks()[key];
+    var c = readRanks();
+    var hit = c[key];
     if (!hit || !Array.isArray(hit.r) || !hit.r.length) return null;
     if (Date.now() - hit.ts > RANKS_DAYS * 86400000) return null;
+
+    /* Least recently USED, not oldest computed. Ranking eviction by
+       computation age retired a thread being worked on daily at the same rate
+       as one opened once and forgotten, which is backwards -- a thread gets
+       reopened precisely because it is still live. Touching the stamp here is
+       what makes the cap below mean "least useful" instead of "oldest".
+
+       Only rewritten once the stamp is actually stale, so reopening the same
+       thread twice in a sitting does not pay for a write it does not need. */
+    if (Date.now() - hit.ts > RANKS_TOUCH_MS) {
+      hit.ts = Date.now();
+      try { localStorage.setItem(KEY_RANKS, JSON.stringify(c)); }
+      catch { /* fine -- it just keeps its older stamp */ }
+    }
     return hit.r;
   }
 
@@ -455,7 +482,7 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
     c[key] = { r: ranked, ts: Date.now() };
     var keys = Object.keys(c);
     if (keys.length > RANKS_MAX) {
-      keys.sort(function (a, b) { return c[a].ts - c[b].ts; });   // oldest out
+      keys.sort(function (a, b) { return c[a].ts - c[b].ts; });   // least recently used out
       keys.slice(0, keys.length - RANKS_MAX).forEach(function (k) { delete c[k]; });
     }
     try { localStorage.setItem(KEY_RANKS, JSON.stringify(c)); }
