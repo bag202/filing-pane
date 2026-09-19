@@ -872,6 +872,20 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
       }
 
       setStatus("ready");
+
+      /* Can this host broker tokens for us? That is what decides whether the
+         hourly re-auth is fixable here at all, and it varies by client and by
+         mailbox type -- it is unsupported on Outlook.com and Gmail mailboxes
+         even where the client supports it. Recorded as a boot mark rather
+         than left to a console check, because reading it by hand means
+         switching DevTools to this iframe's context first. */
+      try {
+        mark("NestedAppAuth 1.1 supported: " +
+          Office.context.requirements.isSetSupported("NestedAppAuth", "1.1"));
+      } catch (e) {
+        mark("NestedAppAuth 1.1 supported: unknown (" + (e && e.message) + ")");
+      }
+
       var m = fromOffice();
       if (m) classify(m);
       if (Office.context.requirements.isSetSupported("Mailbox", "1.5")) {
