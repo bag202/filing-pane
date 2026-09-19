@@ -44,10 +44,24 @@ const FilingClassifier = (() => {
 
   const domainOf = addr => ((addr || "").split("@")[1] || "").toLowerCase();
 
+  /* Examples imported from the original bank carry no timestamp; only the
+     ones this pane files itself get one. Scoring an undated example as though
+     it were infinitely old -- the flat 0.5 this used to return -- meant every
+     newly filed thread pulled about twice as hard as anything in the imported
+     archive, and that skew would have compounded with every use rather than
+     showing up as one traceable wrong answer.
+
+     Undated examples are therefore dated to when that bank was assembled,
+     which is what they honestly are: a snapshot of recent filing taken then.
+     Today that leaves the weighting near-uniform, which is correct, because
+     nothing distinguishes one undated example from another -- and it keeps
+     decaying properly as dated examples accumulate around it. */
+  const BANK_EPOCH = Date.parse("2026-09-16");
+
   // Exponential decay so a 2015 convention doesn't outvote a 2026 one.
   function recencyWeight(ts) {
-    if (!ts) return 0.5;
-    const days = (Date.now() - ts) / 86400000;
+    // max(0) so a clock skewed into the future cannot weigh more than 1.
+    const days = Math.max(0, Date.now() - (ts || BANK_EPOCH)) / 86400000;
     return Math.pow(0.5, days / HALF_LIFE_DAYS);
   }
 
@@ -79,6 +93,11 @@ const FilingClassifier = (() => {
     const msgTokens = tokenize(msg.subject);
     return bank
       .map(ex => ({ ex, score: similarity(msg, ex, msgTokens) }))
+      // Inert in practice, and measured to be: sweeping this from 0.15 to 0.4
+      // retrieves an identical 16.6 examples per message, because almost
+      // nothing scores in that band. It only starts cutting above ~0.6, and
+      // by 0.9 it costs real accuracy (78% -> 75% top-3). Left where it is as
+      // a floor against noise, but do not expect tuning it to do anything.
       .filter(r => r.score > 0.15)
       .sort((a, b) => b.score - a.score)
       .slice(0, MAX_EXAMPLES);
@@ -91,8 +110,11 @@ const FilingClassifier = (() => {
 
      Measured, same leave-one-out as the table above, 134 examples:
 
-       this heuristic alone   55% top-1   78% top-3
-       ranked by the model    81% top-1   93% top-3
+       this heuristic alone   73-74/134 top-1 (~55%)   104/134 top-3 (78%)
+       ranked by the model         81% top-1                 93% top-3
+
+     The top-1 range is one example sitting on a near-tie, not a measurement
+     worth chasing.
 
      So it is worth drawing immediately and worth never trusting. Its three
      folders usually contain the right one, but it puts the right one first
