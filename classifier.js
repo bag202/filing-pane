@@ -87,7 +87,19 @@ const FilingClassifier = (() => {
   /* Instant, no-network guess used while the model call is in flight.
      Aggregates retrieved examples by folder. Usually right for vendor mail
      and usually wrong for internal colleagues -- which is exactly why it is
-     a placeholder and not the answer. */
+     a placeholder and not the answer.
+
+     Measured, same leave-one-out as the table above, 134 examples:
+
+       this heuristic alone   55% top-1   78% top-3
+       ranked by the model    81% top-1   93% top-3
+
+     So it is worth drawing immediately and worth never trusting. Its three
+     folders usually contain the right one, but it puts the right one first
+     only half the time -- and the first card is the one that gets pressed.
+     That gap is the argument against "just show the fast answer": the
+     reorder is nearly the whole value, which is why the model call is
+     streamed rather than replaced with something cheaper. */
   function heuristic(hits) {
     const byFolder = new Map();
     for (const { ex, score } of hits) {
@@ -130,13 +142,52 @@ Reply with JSON only:
 Exactly 3 suggestions, best first, all different, all from the valid list.`;
   }
 
-  // model is optional so an eval harness can sweep it without touching MODEL.
-  async function rank(msg, hits, folders, apiKey, model) {
+  /* Pull whole suggestions out of a half-written JSON reply.
+
+     The model streams `{"suggestions":[{"folder":"03 PDS","why":"..."},...`
+     and the folder name -- the only part needed to draw a pressable button --
+     closes long before the reply does. So a suggestion counts as usable the
+     moment its folder string is terminated; `why` fills in a beat later.
+     Folder names are matched with the closing quote required, so a
+     half-typed name can never be rendered as a real one. */
+  const SUGG_RE =
+    /\{\s*"folder"\s*:\s*"((?:[^"\\]|\\.)*)"(?:\s*,\s*"why"\s*:\s*"((?:[^"\\]|\\.)*)")?/g;
+
+  function parsePartial(text, valid) {
+    const out = [];
+    const seen = new Set();
+    SUGG_RE.lastIndex = 0;
+    let m;
+    while ((m = SUGG_RE.exec(text))) {
+      let folder, why;
+      try {
+        folder = JSON.parse('"' + m[1] + '"');
+        why = m[2] == null ? "" : JSON.parse('"' + m[2] + '"');
+      } catch { continue; }          // escape half-written; wait for more
+      if (valid && !valid.has(folder)) continue;
+      if (seen.has(folder)) continue;
+      seen.add(folder);
+      out.push({ folder, why });
+      if (out.length === 3) break;
+    }
+    return out;
+  }
+
+  /* model is optional so an eval harness can sweep it without touching MODEL.
+     onPartial, if given, is called with the suggestions readable so far --
+     that is the whole point of streaming here. Latency to the *final* answer
+     is unchanged. What shortens is the wait for the top button: fed a typical
+     reply one character at a time, the first folder name is complete after
+     about a fifth of it, the rest being the two lower suggestions and their
+     evidence. That fifth is a fraction of generation only -- time to first
+     token is unchanged, so treat it as a useful cut, not a halving. */
+  async function rank(msg, hits, folders, apiKey, model, onPartial) {
     // Haiku 4.5 rejects output_config.effort outright ("This model does not
     // support the effort parameter"), so only send it where it is supported.
     const body = {
       model: model || MODEL,
       max_tokens: 400,
+      stream: true,
       messages: [{ role: "user", content: buildPrompt(msg, hits, folders) }]
     };
     if (!/haiku/i.test(body.model)) {
@@ -158,22 +209,61 @@ Exactly 3 suggestions, best first, all different, all from the valid list.`;
       throw new Error(`Anthropic ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
     }
 
-    const data = await resp.json();
-    const text = (data.content || [])
-      .filter(b => b.type === "text").map(b => b.text).join("");
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) throw new Error("no JSON in model reply");
-
-    const parsed = JSON.parse(match[0]);
     const valid = new Set(folders);
-    const out = (parsed.suggestions || [])
-      .filter(s => s && valid.has(s.folder))
-      .slice(0, 3);
+    let text = "";
+
+    if (resp.body && resp.body.getReader) {
+      const reader = resp.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      let shown = 0;
+      for (;;) {
+        const { value, done } = await reader.read();
+        // On the last read, append the frame terminator rather than breaking
+        // out: that lets the split below pick up a tail frame the server did
+        // not blank-line off, so it cannot silently drop the third suggestion.
+        buf += done ? "\n\n" : dec.decode(value, { stream: true });
+
+        // SSE frames are blank-line separated; keep any trailing partial.
+        const frames = buf.split("\n\n");
+        buf = frames.pop();
+        for (const frame of frames) {
+          for (const line of frame.split("\n")) {
+            if (!line.startsWith("data:")) continue;
+            const raw = line.slice(5).trim();
+            if (!raw || raw === "[DONE]") continue;
+            let ev;
+            try { ev = JSON.parse(raw); } catch { continue; }
+            if (ev.type === "content_block_delta" && ev.delta) {
+              text += ev.delta.text || ev.delta.partial_json || "";
+            } else if (ev.type === "error") {
+              throw new Error("Anthropic stream: " +
+                ((ev.error && ev.error.message) || "unknown"));
+            }
+          }
+        }
+
+        if (onPartial) {
+          const soFar = parsePartial(text, valid);
+          // Only call up when there is genuinely more to draw, so a click
+          // target is not rebuilt underneath a finger on every chunk.
+          if (soFar.length > shown) { shown = soFar.length; onPartial(soFar); }
+        }
+        if (done) break;
+      }
+    } else {
+      // No streaming support in this engine -- take the whole body at once.
+      const data = await resp.json();
+      text = (data.content || [])
+        .filter(b => b.type === "text").map(b => b.text).join("");
+    }
+
+    const out = parsePartial(text, valid);
     if (!out.length) throw new Error("model returned no valid folder");
     return out;
   }
 
-  return { tokenize, retrieve, heuristic, rank, MODEL };
+  return { tokenize, retrieve, heuristic, rank, parsePartial, MODEL };
 })();
 
 if (typeof window !== "undefined") window.FilingClassifier = FilingClassifier;
