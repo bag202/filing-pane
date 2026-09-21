@@ -164,6 +164,7 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
   var seq = 0;            // guards against out-of-order async renders
   var msalApp = null;
   var brokered = false;   // true once the host is brokering our tokens
+  var hostReady = null;   // settles when the Office handshake does (see boot)
   var dialog = null;
 
   function setStatus(t) { $("status").textContent = t; }
@@ -226,7 +227,25 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
      Inert until brk-multihub://<origin> is registered as an SPA redirect URI
      on the app registration. Without it the broker declines and we fall
      through to the dialog below, exactly as before. */
+  /* Waits for the Office handshake before choosing a path.
+
+     Boot deliberately runs the bank read, the folder read and the handshake
+     at once, which means a token can be wanted before Office has finished
+     connecting. Deciding then read Office.context.requirements too early,
+     always got "no broker here", and cached a standalone client for the life
+     of the pane -- so the check passing 180ms later changed nothing. The
+     symptom was NestedAppAuth reporting supported while every sign-in still
+     went through the dialog.
+
+     Costs nothing on the common path: a live cached token never reaches
+     MSAL at all. It is only paid when a token actually has to be fetched,
+     which is already the slow case. */
   function buildMsal() {
+    if (msalApp) return Promise.resolve(msalApp);
+    return (hostReady || Promise.resolve(null)).then(decideMsal);
+  }
+
+  function decideMsal() {
     if (msalApp) return Promise.resolve(msalApp);
 
     if (hostBrokersTokens() && msal.createNestablePublicClientApplication) {
@@ -256,6 +275,9 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
 
   function buildStandaloneMsal() {
     if (msalApp) return Promise.resolve(msalApp);
+    // Marked as well as the brokered case: the absence of a mark was what
+    // made the race above hard to read the first time.
+    mark("msal ready (standalone; the host is not brokering)");
     msalApp = new msal.PublicClientApplication({
       auth: {
         clientId: CLIENT_ID,
@@ -939,6 +961,17 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
     });
   }
 
+  /* One handshake promise, awaited by boot and by the auth path both, so
+     neither waits twice and neither reads the host before it can answer.
+     Inside a host we can afford to wait properly; the pane is useless
+     without the selected message, so falling back early helps nobody.
+     Opened directly in a browser tab, fail over quickly to the harness.
+
+     Assigned BEFORE the reads below, not after. They can want a token
+     immediately, and a token wanted while this is still null is exactly the
+     race that made the pane decide it had no broker. */
+  hostReady = withTimeout(officeReady, inHost ? 20000 : 1500);
+
   /* These three do not depend on each other, and running them in a chain was
      the single largest delay before a suggestion appeared: the Office
      handshake did not begin counting down until two network reads had already
@@ -951,10 +984,7 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
   Promise.all([
     bankReady,
     loadFolders(false),
-    // Inside a host we can afford to wait properly; the pane is useless
-    // without the selected message, so falling back early helps nobody.
-    // Opened directly in a browser tab, fail over quickly to the harness.
-    withTimeout(officeReady, inHost ? 20000 : 1500)
+    hostReady
   ])
     .then(function (settled) {
       if (!folders.length) foldersFromBank();
