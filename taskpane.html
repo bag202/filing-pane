@@ -57,6 +57,8 @@ body{margin:0;padding:12px;background:var(--panel);color:var(--ink);
 .sugg.top .fn{color:var(--ms-ink)}
 .sugg.top .wy{color:var(--ms)}
 .sugg.prov{opacity:.62}
+.sugg.pick{border-color:var(--ms);background:var(--ms-soft)}
+.sugg.pick .fn{color:var(--ms-ink)}
 button.link{background:none;border:0;color:var(--ms);cursor:pointer;font:inherit;
   font-size:11px;padding:0;text-decoration:none}
 button.link:hover{text-decoration:underline}
@@ -763,14 +765,27 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
   }
 
   // ---- folder search -------------------------------------------------
-  $("folder-search").addEventListener("input", function (e) {
-    var q = e.target.value.trim().toLowerCase();
+  // The results behave like a combobox: one row is always marked as the one
+  // Enter will act on, so the keyboard and the mouse file the same folder and
+  // you can see which one before you commit.
+  var searchHits = [], searchPick = 0;
+
+  function paintPick() {
+    var rows = $("results").children;
+    for (var i = 0; i < rows.length; i++) {
+      rows[i].className = "sugg" + (i === searchPick ? " pick" : "");
+    }
+    if (rows[searchPick]) rows[searchPick].scrollIntoView({ block: "nearest" });
+  }
+
+  function renderSearch(q) {
     var host = $("results");
     host.innerHTML = "";
-    if (!q) return;
-    folders.filter(function (f) {
+    searchHits = !q ? [] : folders.filter(function (f) {
       return f.toLowerCase().indexOf(q) !== -1;
-    }).slice(0, 8).forEach(function (f) {
+    }).slice(0, 8);
+    if (searchPick >= searchHits.length) searchPick = 0;
+    searchHits.forEach(function (f) {
       var b = document.createElement("button");
       b.className = "sugg";
       var fn = document.createElement("span");
@@ -779,6 +794,38 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
       b.onclick = function () { fileTo(f); };
       host.appendChild(b);
     });
+    paintPick();
+  }
+
+  $("folder-search").addEventListener("input", function (e) {
+    searchPick = 0;                      // a new query always aims at the top hit
+    renderSearch(e.target.value.trim().toLowerCase());
+  });
+
+  $("folder-search").addEventListener("keydown", function (e) {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      if (!searchHits.length) return;
+      e.preventDefault();                // don't let the caret jump in the box
+      var next = searchPick + (e.key === "ArrowDown" ? 1 : -1);
+      searchPick = next < 0 ? 0
+        : next >= searchHits.length ? searchHits.length - 1 : next;
+      paintPick();
+      return;
+    }
+    if (e.key === "Enter") {
+      var row = $("results").children[searchPick];
+      // A disabled row means a move is already in flight. Leaning on Enter
+      // must not send the same thread twice.
+      if (!row || row.disabled) return;
+      e.preventDefault();
+      fileTo(searchHits[searchPick]);
+      return;
+    }
+    if (e.key === "Escape") {
+      e.target.value = "";
+      searchPick = 0;
+      renderSearch("");
+    }
   });
 
   // ---- settings ------------------------------------------------------
