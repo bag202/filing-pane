@@ -10,6 +10,7 @@ const Graph = (() => {
 
   const ROOT = "https://graph.microsoft.com/v1.0";
   const MAX_DEPTH = 4;            // deeper than the mailbox tree actually goes
+  const BATCH_MAX = 20;           // Graph's per-$batch request limit
 
   async function call(token, path, init) {
     const resp = await fetch(ROOT + path, Object.assign({
@@ -99,10 +100,41 @@ const Graph = (() => {
       // just less complete. Better than refusing to file at all.
     }
 
-    // Sequential on purpose: a parallel burst of moves against one mailbox
-    // invites 429s, and there are rarely more than a handful per thread.
+    /* One $batch per 20 moves rather than one request per message. Moving
+       one at a time was fine for the handful a thread usually holds, but a
+       15-message thread took several seconds of round trips -- long enough
+       for Outlook to reload the pane under us. Anything the batch could not
+       move (a 429 inside it, say) is retried on its own, sequentially, so a
+       throttled burst still ends with the whole thread filed. */
     let moved = 0;
-    for (const id of ids) {
+    const retry = [];
+    for (let i = 0; i < ids.length; i += BATCH_MAX) {
+      const chunk = ids.slice(i, i + BATCH_MAX);
+      let responses;
+      try {
+        const out = await call(token, "/$batch", {
+          method: "POST",
+          body: JSON.stringify({
+            requests: chunk.map((id, n) => ({
+              id: String(n),
+              method: "POST",
+              url: `/me/messages/${id}/move`,
+              headers: { "content-type": "application/json" },
+              body: { destinationId }
+            }))
+          })
+        });
+        responses = (out && out.responses) || [];
+      } catch {
+        responses = [];            // whole batch refused; retry every item
+      }
+      const ok = new Set(responses
+        .filter(r => r.status >= 200 && r.status < 300)
+        .map(r => Number(r.id)));
+      chunk.forEach((id, n) => { if (ok.has(n)) moved++; else retry.push(id); });
+    }
+
+    for (const id of retry) {
       await moveMessage(token, id, destinationId);
       moved++;
     }

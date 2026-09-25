@@ -984,8 +984,22 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
      Office appends _host_Info to the task pane URL when it loads us, so this
      is known synchronously and does not depend on any handshake completing.
      Guessing from a timer instead was the original bug: the pane decided it
-     was not in Outlook simply because the host was slow to answer. */
-  var inHost = /[?&]_host_Info=/i.test(window.location.search);
+     was not in Outlook simply because the host was slow to answer.
+
+     But the query string only carries it on the first load. When Outlook
+     reloads the pane in place -- which it does after a large move takes the
+     open item away -- the URL comes back bare and Office.js reads the value
+     it cached in sessionStorage instead. Trusting the URL alone sent a
+     reloaded pane down the 1.5s browser-tab path, into the harness, and
+     deaf to every message clicked after. Being framed at all is the other
+     tell: opened directly in a browser tab, we are the top window. */
+  var inHost = /[?&]_host_Info=/i.test(window.location.search) ||
+    (function () {
+      try { if (sessionStorage.getItem("hostInfoValue")) return true; }
+      catch { /* storage blocked -- fall through to the frame check */ }
+      try { return window.self !== window.top; }
+      catch { return true; }   // cross-origin parent: framed by definition
+    })();
 
   /* Start the handshake NOW, not after the bank and folder loads. Those are
      network-bound and used to delay this by seconds. Calling Office.onReady()
@@ -1052,9 +1066,24 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
             "connecting, so there is no selected message. Reopen the pane, " +
             "and if it keeps happening the console will have the reason.");
         }
+        /* The timeout above only decides when to stop waiting, not whether
+           the host is there. If the handshake lands after we gave up, take
+           it: a pane stuck in the harness while Outlook is ready and waiting
+           is the failure that looks like "not responding". */
+        officeReady.then(function (late) {
+          if (!(late && late.host) || !(Office.context && Office.context.mailbox)) return;
+          mark("office ready late; leaving the harness");
+          $("harness").style.display = "none";
+          alertBox("", "");
+          goLive();
+        }, function () {});
         return;
       }
 
+      goLive();
+    });
+
+  function goLive() {
       setStatus("ready");
 
       /* Can this host broker tokens for us? That is what decides whether the
@@ -1079,7 +1108,7 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
             if (n) classify(n);
           });
       }
-    });
+  }
 })();
 </script>
 </body>
