@@ -510,6 +510,9 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
       alertBox("ok", "Filed " + moved + (moved === 1 ? " message" : " messages") +
         " to <b>" + path + "</b>.");
       setStatus("filed");
+      // The query has done its job; a failed move keeps it so a retry is
+      // one keystroke away.
+      clearSearch();
       // A correction is worth more than an acceptance: record what was
       // actually chosen so the bank learns the boundary it got wrong.
       recordChoice(path);
@@ -821,12 +824,14 @@ input:focus-visible{outline:2px solid var(--ms);outline-offset:-1px}
       fileTo(searchHits[searchPick]);
       return;
     }
-    if (e.key === "Escape") {
-      e.target.value = "";
-      searchPick = 0;
-      renderSearch("");
-    }
+    if (e.key === "Escape") clearSearch();
   });
+
+  function clearSearch() {
+    $("folder-search").value = "";
+    searchPick = 0;
+    renderSearch("");
+  }
 
   // ---- settings ------------------------------------------------------
   $("toggle-panel").onclick = function () {
